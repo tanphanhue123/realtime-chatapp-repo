@@ -1,0 +1,15 @@
+filebeatConfig:
+  filebeat.yml: |-
+    filebeat.inputs:
+      - type: container
+        paths:
+          - /app/storage/logs/*
+        processors:
+          - add_kubernetes_metadata:
+              host: ${NODE_NAME}
+              matchers:
+                - logs_path:
+                    logs_path: "/app/storage/logs"
+
+    output.logstash:
+      hosts: ["logstash-logstash:5044"]

@@ -1,0 +1,19 @@
+name: Deploy EKS DEV
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'develop'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  cd:
+    uses: ./.github/workflows/deploy-eks-template.yaml
+    with: 
+      env: dev
+      region: ap-southeast-1
+      service: eks
+    secrets: inherit

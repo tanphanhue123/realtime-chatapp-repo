@@ -14,177 +14,180 @@ on:
 name: Deploy EKS
 
 jobs:
-  cd:
-    name: Deploy-${{ inputs.env }}-${{ inputs.service }}
+  notify-start:
+    name: Start deploy
     runs-on: ubuntu-22.04
-    permissions:
-      id-token: write 
-      contents: read
-      security-events: write
     environment: ${{ inputs.env }}
-    env:
-      ENV: ${{ inputs.env }}
-      PROJECT: pet
-      SERVICE: ${{ inputs.service }}
-      REGION: ${{ inputs.region }}
-      SLACK_WEBHOOK_URL: ${{ secrets.slack_webhook_url }}
-      SLACK_CHANNEL_ID: ${{ secrets.slack_channel_id }}
-      ECR_REPO_NAME: ${{ secrets.ECR_REPO_NAME }}
-      ACCOUNT_ID: ${{ secrets.account_id }}
-      GITOPS_REPO_TOKEN: ${{ secrets.GITOPS_REPO_TOKEN }}
-      GITOPS_REPO_URL: ${{ secrets.GITOPS_REPO_URL }}
-      ROLE_ARN: ${{ secrets.ROLE_ARN }}
-
     steps:
-      - name: Start deploy slack notification
+      - name: Notify success
         uses: rtCamp/action-slack-notify@v2
         env:
-          SLACK_WEBHOOK: ${{ env.SLACK_WEBHOOK_URL }}
-          SLACK_CHANNEL: ${{ env.SLACK_CHANNEL_ID }}
-          SLACK_TITLE: Start deploy ${{ env.ENV }}-${{ env.PROJECT }}-${{ env.SERVICE }}
+          SLACK_WEBHOOK: ${{ secrets.slack_webhook_url }}
+          SLACK_CHANNEL: ${{ secrets.slack_channel_id }}
+          SLACK_TITLE: Start deploy ${{ inputs.service }}-${{ inputs.env }}
           SLACK_COLOR: "#1b55de"
   
-      - name: Configure aws credentials
-        uses: aws-actions/configure-aws-credentials@v4.1.0
-        with:
-          role-to-assume: ${{ env.ROLE_ARN }}
-          aws-region: ${{ env.REGION }}
-
-      - name: Checkout code
-        uses: actions/checkout@v4
-      
-      - name: Run Snyk to check for vulnerabilities
+  scan-code:
+    name: Snyk SCA
+    runs-on: ubuntu-22.04
+    needs: notify-start
+    permissions:
+      security-events: write
+      contents: read
+    environment: ${{ inputs.env }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Snyk scan
         uses: snyk/actions/php@master
         continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         with:
           args: --sarif-file-output=snyk.sarif
-      - name: Upload result to GitHub Code Scanning
+      - name: Upload results
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: snyk.sarif
-      
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        
-      - name: Cache Docker layers
-        uses: actions/cache@v4
+
+  build-push:
+    name: Build & Push
+    runs-on: ubuntu-22.04
+    needs: scan-code
+    permissions:
+      id-token: write
+      contents: read
+    environment: ${{ inputs.env }}
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4.1.0
         with:
-          path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-buildx-
-
-      - name: Add SHORT_SHA env property with commit short sha
-        run: |
-          echo "SHORT_SHA=`echo ${GITHUB_SHA} | cut -c1-8`" >> $GITHUB_ENV
-      
-      - name: Login to Amazon ECR
-        id: login-ecr
+          role-to-assume: ${{ secrets.ROLE_ARN }}
+          aws-region: ${{ inputs.region }}
+      - name: Get tag
+        id: tag
+        run: echo "tag=$(echo ${GITHUB_SHA} | cut -c1-8)" >> $GITHUB_OUTPUT
+      - name: ECR login
         uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build and Push image
+      - name: Build & Push
         uses: docker/build-push-action@v6
         with:
-          context: .
           push: true
           tags: |
-           ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.REGION }}.amazonaws.com/${{ env.ECR_REPO_NAME }}:${{ env.SHORT_SHA }},
-           ${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.REGION }}.amazonaws.com/${{ env.ECR_REPO_NAME }}:latest
+            ${{ secrets.account_id }}.dkr.ecr.${{ inputs.region }}.amazonaws.com/${{ secrets.ECR_REPO_NAME }}:${{ steps.tag.outputs.tag }}
+            ${{ secrets.account_id }}.dkr.ecr.${{ inputs.region }}.amazonaws.com/${{ secrets.ECR_REPO_NAME }}:latest
           build-args: |
             VITE_REVERB_APP_KEY=${{ secrets.VITE_REVERB_APP_KEY }}
             VITE_REVERB_HOST=${{ secrets.VITE_REVERB_HOST }}
             VITE_REVERB_PORT=${{ secrets.VITE_REVERB_PORT }}
             VITE_REVERB_SCHEME=${{ secrets.VITE_REVERB_SCHEME }}
             VITE_REVERB_PATH=${{ secrets.VITE_REVERB_PATH }}
-          cache-from: type=local,src=/tmp/.buildx-cache
-          cache-to: type=local,dest=/tmp/.buildx-cache
-          provenance: false
-      
-      - name: Run Trivy vulnerability scan
+
+  image-scan:
+    name: Trivy Image Scan
+    runs-on: ubuntu-22.04
+    needs: build-push
+    permissions:
+      id-token: write
+      contents: read
+      security-events: write
+    environment: ${{ inputs.env }}
+    steps:
+      - name: AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4.1.0
+        with:
+          role-to-assume: ${{ secrets.ROLE_ARN }}
+          aws-region: ${{ inputs.region }}
+      - name: ECR login
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Trivy scan
         uses: aquasecurity/trivy-action@0.30.0
         with:
-          image-ref: '${{ env.ACCOUNT_ID }}.dkr.ecr.${{ env.REGION }}.amazonaws.com/${{ env.ECR_REPO_NAME }}:${{ env.SHORT_SHA }}'
-          format: 'sarif'
-          exit-code: 0
-          severity: 'CRITICAL,HIGH'
-          output: 'trivy-results.sarif'
- 
-      - name: Upload Trivy scan results to GitHub Security tab
+          image-ref: ${{ secrets.account_id }}.dkr.ecr.${{ inputs.region }}.amazonaws.com/${{ secrets.ECR_REPO_NAME }}:${{ needs.build-push.outputs.tag }}
+          format: sarif
+          output: trivy-results.sarif
+      - name: Upload results
         uses: github/codeql-action/upload-sarif@v3
         with:
-            sarif_file: 'trivy-results.sarif'      
+          sarif_file: trivy-results.sarif
 
-      - name: Checkout private tools
+  update-image-tags:
+    name: Update Image Tags
+    runs-on: ubuntu-22.04
+    needs: [scan-code, build-push, image-scan]
+    environment: ${{ inputs.env }}
+    steps:
+      - name: Checkout GitOps repo
         uses: actions/checkout@v4
         with:
           repository: tanphanhue123/gitops-chatapp
-          token: ${{ env.GITOPS_REPO_TOKEN }}
-
-      - name: Update Image tags in GitOps repository
+          token: ${{ secrets.GITOPS_REPO_TOKEN }}
+      - name: Update tags
         run: |
-          DIRECTORIES=($(ls -d helm-chart/*/ | cut -d'/' -f2 | grep -v "database"))
-          echo "Found directories in helm-chart: ${DIRECTORIES[*]}"
+          TAG=${{ needs.build-push.outputs.tag }}
+          ENV=${{ inputs.env }}
           
-          TAG_VERSION=${{ env.SHORT_SHA }}
-          ENV=${{ env.ENV }}
-          
-          echo "Updating tag to ${TAG_VERSION} in environment: ${ENV}"
-          for dir in "${DIRECTORIES[@]}"; do
+          for dir in $(ls -d helm-chart/*/ | cut -d'/' -f2 | grep -v "database"); do
             if [ -f "helm-chart/${dir}/values-${ENV}.yaml" ]; then
-              echo "Updating tag in helm-chart/${dir}/values-${ENV}.yaml"
-              sed -i "s/tag:.*$/tag: \"${TAG_VERSION}\"/" "helm-chart/${dir}/values-${ENV}.yaml"
-            else
-              echo "File helm-chart/${dir}/values-${ENV}.yaml not found. Skipping."
+              sed -i "s/tag:.*$/tag: \"${TAG}\"/" "helm-chart/${dir}/values-${ENV}.yaml"
             fi
           done
           
-          git remote -v
           git config --global user.email "github-actions@github.com"
           git config --global user.name "GitHub Actions"
           
           if [[ -n $(git status -s) ]]; then
-            echo "Changes detected, committing..."
             git add .
-            git commit -m "Update tag to ${TAG_VERSION} for ${ENV} environment"
+            git commit -m "Update tag to ${TAG} for ${ENV}"
             git push
-            echo "Changes pushed successfully"
-          else
-            echo "No changes detected, skipping commit"
-          fi          
-        shell: bash
+          fi
+  
+  # DAST:
+  #   runs-on: ubuntu-22.04
+  #   name: OWASP DAST
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v4
+  #     - name: OWASP Scan
+  #       uses: zaproxy/action-baseline@v0.14.0
+  #       with:
+  #         token: ${{ secrets.GITHUB_TOKEN }}
+  #         docker_name: 'ghcr.io/zaproxy/zaproxy:stable'
+  #         target: 'https://tanphanhue.shop'
+  #         cmd_options: '-a'
 
-      - name: Deploy fail slack notification
-        if: ${{ failure() }}
+  notify-end:
+    name: Finish deploy
+    runs-on: ubuntu-22.04
+    if: always()
+    needs: [notify-start, scan-code, build-push, image-scan, update-image-tags]
+    environment: ${{ inputs.env }}
+    steps:
+      - name: Notify success
+        if: ${{ !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') }} 
         uses: rtCamp/action-slack-notify@v2
         env:
-          SLACK_WEBHOOK: ${{ env.SLACK_WEBHOOK_URL }}
-          SLACK_CHANNEL: ${{ env.SLACK_CHANNEL_ID }}
-          SLACK_TITLE: Deploy ${{ env.ENV }}-${{ env.PROJECT }}-${{ env.SERVICE }} failed
+          SLACK_WEBHOOK: ${{ secrets.slack_webhook_url }}
+          SLACK_CHANNEL: ${{ secrets.slack_channel_id }}
+          SLACK_TITLE: Deploy ${{ inputs.service }}-${{ inputs.env }} succeeded
+          SLACK_COLOR: "#00ff00"
+      
+      - name: Notify failure
+        if: ${{ contains(needs.*.result, 'failure') }} 
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.slack_webhook_url }}
+          SLACK_CHANNEL: ${{ secrets.slack_channel_id }}
+          SLACK_TITLE: Deploy ${{ inputs.service }}-${{ inputs.env }} failed
           SLACK_COLOR: "#e80909"
-
-      - name: Deploy success slack notification
-        if: ${{ success() }}
+      
+      - name: Notify cancelled
+        if: ${{ contains(needs.*.result, 'cancelled') }} 
         uses: rtCamp/action-slack-notify@v2
         env:
-          SLACK_WEBHOOK: ${{ env.SLACK_WEBHOOK_URL }}
-          SLACK_CHANNEL: ${{ env.SLACK_CHANNEL_ID }}
-          SLACK_TITLE: Deploy ${{ env.ENV }}-${{ env.PROJECT }}-${{ env.SERVICE }} succeeded
-
-      - name: Stop deploy slack notification
-        if: ${{ cancelled() }}
-        uses: rtCamp/action-slack-notify@v2
-        env:
-          SLACK_WEBHOOK: ${{ env.SLACK_WEBHOOK_URL }}
-          SLACK_CHANNEL: ${{ env.SLACK_CHANNEL_ID }}
-          SLACK_TITLE: Deploy ${{ env.ENV }}-${{ env.PROJECT }}-${{ env.SERVICE }} cancelled
+          SLACK_WEBHOOK: ${{ secrets.slack_webhook_url }}
+          SLACK_CHANNEL: ${{ secrets.slack_channel_id }}
+          SLACK_TITLE: Deploy ${{ inputs.service }}-${{ inputs.env }} cancelled
           SLACK_COLOR: "#fae102"
-
-      - name: ZAP Scan
-        uses: zaproxy/action-full-scan@v0.12.0
-        with:
-          token: ${{ secrets.GITOPS_REPO_TOKEN }}
-          docker_name: 'ghcr.io/zaproxy/zaproxy:stable'
-          target: 'https://www.zaproxy.org/'
-          cmd_options: '-a'

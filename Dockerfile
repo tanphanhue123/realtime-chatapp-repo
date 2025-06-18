@@ -23,12 +23,6 @@ COPY . .
 
 RUN composer install --no-interaction --prefer-dist --optimize-autoloader
 
-ARG VITE_REVERB_APP_KEY
-ARG VITE_REVERB_HOST
-ARG VITE_REVERB_PORT
-ARG VITE_REVERB_SCHEME
-ARG VITE_REVERB_PATH
-
 RUN npm install && npm run build
 
 # FROM base AS reverb

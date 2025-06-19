@@ -27,8 +27,8 @@ jobs:
           SLACK_TITLE: Start deploy ${{ inputs.service }}-${{ inputs.env }}
           SLACK_COLOR: "#1b55de"
   
-  scan-code:
-    name: Snyk SCA
+  security-scan:
+    name: Snyk Security Scan
     runs-on: ubuntu-22.04
     needs: notify-start
     permissions:
@@ -36,23 +36,44 @@ jobs:
       contents: read
     environment: ${{ inputs.env }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Snyk scan
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Snyk SCA - Dependency Scan
         uses: snyk/actions/php@master
         continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         with:
-          args: --sarif-file-output=snyk.sarif
-      - name: Upload results
+          args: --sarif-file-output=snyk-sca.sarif --severity-threshold=medium
+      
+      - name: Snyk SAST - Code Analysis
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          command: code test
+          args: --severity-threshold=medium --sarif-file-output=snyk-sast.sarif
+      
+      - name: Upload SCA Results
         uses: github/codeql-action/upload-sarif@v3
         with:
-          sarif_file: snyk.sarif
+          sarif_file: snyk-sca.sarif
+          category: "snyk-sca"
+      
+      - name: Upload SAST Results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk-sast.sarif
+          category: "snyk-sast"
 
   build-push:
     name: Build & Push
     runs-on: ubuntu-22.04
-    needs: scan-code
+    needs: security-scan
     permissions:
       id-token: write
       contents: read
@@ -102,6 +123,7 @@ jobs:
           image-ref: ${{ secrets.account_id }}.dkr.ecr.${{ inputs.region }}.amazonaws.com/${{ secrets.ECR_REPO_NAME }}:${{ needs.build-push.outputs.tag }}
           format: sarif
           output: trivy-results.sarif
+          severity: 'CRITICAL,HIGH,MEDIUM'
       - name: Upload results
         uses: github/codeql-action/upload-sarif@v3
         with:
@@ -110,7 +132,7 @@ jobs:
   update-image-tags:
     name: Update Image Tags
     runs-on: ubuntu-22.04
-    needs: [scan-code, build-push, image-scan]
+    needs: [security-scan, build-push, image-scan]
     environment: ${{ inputs.env }}
     steps:
       - name: Checkout GitOps repo
@@ -156,7 +178,7 @@ jobs:
     name: Finish deploy
     runs-on: ubuntu-22.04
     if: always()
-    needs: [notify-start, scan-code, build-push, image-scan, update-image-tags]
+    needs: [notify-start, security-scan, build-push, image-scan, update-image-tags]
     environment: ${{ inputs.env }}
     steps:
       - name: Notify success

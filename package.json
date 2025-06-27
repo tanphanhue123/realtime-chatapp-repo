@@ -20,7 +20,7 @@
     },
     "dependencies": {
         "axios": "^1.7.4",
-        "bootstrap": "^5.2.3",
+        "bootstrap": "^5.3.6",
         "canvas-confetti": "^1.9.3",
         "jquery": "^3.7.1",
         "vue": "^3.2.37",
